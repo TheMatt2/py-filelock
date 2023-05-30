@@ -112,12 +112,36 @@ def test_ro_file(lock_type: type[BaseFileLock], tmp_file_ro: Path) -> None:
         lock.acquire()
 
 
-@pytest.mark.parametrize("lock_type", [FileLock, SoftFileLock])
-def test_missing_directory(lock_type: type[BaseFileLock], tmp_path_ro: Path) -> None:
-    lock_path = tmp_path_ro / "a" / "b"
-    lock = lock_type(str(lock_path))
+WindowsOnly = pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 
-    with pytest.raises(OSError, match="No such file or directory:"):
+
+@pytest.mark.parametrize("lock_type", [FileLock, SoftFileLock])
+@pytest.mark.parametrize(
+    ("expected_error", "match", "bad_lock_file"),
+    [
+        pytest.param(FileNotFoundError, "No such file or directory:", "a/b", id="non_existent_directory"),
+        pytest.param(FileNotFoundError, "No such file or directory:", "", id="blank_filename"),
+        pytest.param(ValueError, "embedded null (byte|character)", "\0", id="null_byte"),
+        pytest.param(
+            PermissionError if sys.platform == "win32" else IsADirectoryError,
+            "Permission denied:" if sys.platform == "win32" else "Is a directory",
+            ".",
+            id="current_directory",
+        ),
+    ]
+    + [pytest.param(OSError, "Invalid argument", i, id=f"invalid_{i}", marks=WindowsOnly) for i in '<>:"|?*\a']
+    + [pytest.param(PermissionError, "Permission denied:", i, id=f"permission_{i}", marks=WindowsOnly) for i in "/\\"],
+)
+@pytest.mark.timeout(5)  # timeout in case of infinite loop
+def test_bad_lock_file(
+    lock_type: type[BaseFileLock],
+    expected_error: type[Exception],
+    match: str,
+    bad_lock_file: str,
+) -> None:
+    lock = lock_type(bad_lock_file)
+
+    with pytest.raises(expected_error, match=match):
         lock.acquire()
 
 
@@ -588,3 +612,20 @@ def test_thrashing_with_thread_pool_lock_recreated_in_each_thread(
             results.append(executor.submit(mess_with_file))
 
     assert all(r.result() is None for r in results)
+
+
+@pytest.mark.parametrize("lock_type", [FileLock, SoftFileLock])
+def test_lock_can_be_non_thread_local(
+    tmp_path: Path,
+    lock_type: type[BaseFileLock],
+) -> None:
+    lock = lock_type(tmp_path / "test.lock", thread_local=False)
+
+    for _ in range(2):
+        thread = threading.Thread(target=lock.acquire, kwargs={"timeout": 2})
+        thread.start()
+        thread.join()
+
+    assert lock.lock_counter == 2
+
+    lock.release(force=True)
